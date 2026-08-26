@@ -3,6 +3,8 @@ import { createServices } from '../core/index.js';
 import { CloudflareApiError, ConfigError, TunnelManagerError } from '../core/errors.js';
 import { viteSnippet, VITE_WHY } from '../core/health.js';
 import { validateProtocol } from '../core/tunnel-service.js';
+import { sudoCommandFor } from '../core/launchd.js';
+import type { ProcessManager } from '../core/process-manager.js';
 import type { Mapping, Protocol, Snapshot } from '../core/types.js';
 import { c, table } from './format.js';
 
@@ -20,6 +22,9 @@ ${c.bold('COMANDOS')}
   off <sub>                         Quita el ingress, conserva el CNAME
   on <sub> [puerto]                 Restaura el ingress con el puerto recordado
   rm <sub> [--keep-dns]             Borra ingress + CNAME (pide confirmacion)
+  service [start|stop|restart]      Estado del cloudflared local; con accion, lo controla
+  logs [-n N] [-f]                  Log de cloudflared (del servicio o del hijo)
+  mode [service|spawn]              Muestra o cambia el modo de operacion
   prefs                             Muestra las preferencias locales
 
 ${c.bold('OPCIONES')}
@@ -28,6 +33,12 @@ ${c.bold('OPCIONES')}
   --yes, -y                No pedir confirmacion
   --no-health              Omite el health check local (mas rapido)
   --json                   Salida JSON cruda
+  -n <N>                   En logs, cuantas lineas mostrar (default 40)
+  -f                       En logs, seguir en vivo (Ctrl-C para salir)
+
+${c.bold('NOTA SOBRE SUDO')}
+  "service start|stop|restart" ejecuta "sudo launchctl ...". La contrasena se
+  pide en ESTA terminal, no en el navegador. Sin confirmacion no se ejecuta nada.
 `;
 
 interface Flags {
@@ -36,11 +47,13 @@ interface Flags {
   yes: boolean;
   health: boolean;
   json: boolean;
+  lines: number;
+  follow: boolean;
 }
 
 function parseArgs(argv: string[]): { cmd: string; positional: string[]; flags: Flags } {
   const positional: string[] = [];
-  const flags: Flags = { keepDns: false, yes: false, health: true, json: false };
+  const flags: Flags = { keepDns: false, yes: false, health: true, json: false, lines: 40, follow: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] ?? '';
     if (a === '--proto') flags.proto = validateProtocol(argv[++i] ?? '');
@@ -49,6 +62,8 @@ function parseArgs(argv: string[]): { cmd: string; positional: string[]; flags: 
     else if (a === '--yes' || a === '-y') flags.yes = true;
     else if (a === '--no-health') flags.health = false;
     else if (a === '--json') flags.json = true;
+    else if (a === '-n') flags.lines = Number(argv[++i] ?? 40);
+    else if (a === '-f' || a === '--follow') flags.follow = true;
     else if (a.startsWith('-')) throw new TunnelManagerError(`Opcion desconocida: ${a}`);
     else positional.push(a);
   }
@@ -97,6 +112,39 @@ function renderSnapshot(s: Snapshot): string {
   return [head, '', body, warns ? `\n${warns}` : ''].join('\n');
 }
 
+
+function colorizeLog(line: string): string {
+  if (/\bERR\b|\berror\b/i.test(line)) return c.red(line);
+  if (/\bWRN\b|\bwarn\b/i.test(line)) return c.yellow(line);
+  if (/Registered tunnel connection|Updated to new configuration/i.test(line)) return c.green(line);
+  return c.dim(line);
+}
+
+async function printLocalStatus(proc: ProcessManager, opts: { verbose?: boolean } = {}): Promise<void> {
+  const st = await proc.status();
+  const good = st.launchd.state === 'running' || st.spawn.running;
+  console.log(`${c.bold('cloudflared local')}  modo=${st.mode}  ${good ? c.green(st.summary) : c.yellow(st.summary)}`);
+
+  if (st.mode === 'service' && st.launchd.supported) {
+    const l = st.launchd;
+    console.log(
+      `  launchd: cargado=${l.loaded ? c.green('si') : c.red('no')}` +
+        `  estado=${l.state ?? '-'}  pid=${l.pid ?? '-'}  arranques=${l.runs ?? '-'}` +
+        `  ultima salida=${l.lastExitCode ?? '-'}`,
+    );
+    if (opts.verbose) {
+      console.log(c.gray(`  plist:  ${l.plistPath ?? '-'} (existe=${l.plistExists})`));
+      console.log(c.gray(`  binario:${l.program ?? '-'}`));
+      console.log(c.gray(`  log:    ${l.stderrPath ?? '-'}`));
+    }
+  }
+
+  const procList = st.processes.map((p) => `pid ${p.pid}`).join(', ');
+  console.log(`  procesos cloudflared en este host: ${st.processes.length || c.red('0')}${procList ? c.dim(` (${procList})`) : ''}`);
+
+  for (const w of st.warnings) console.log(`  ${c.yellow('!')} ${w}`);
+}
+
 async function confirm(question: string): Promise<boolean> {
   if (!process.stdin.isTTY) return false;
   process.stdout.write(`${question} [s/N] `);
@@ -118,7 +166,7 @@ async function main(): Promise<number> {
   }
 
   const { cmd, positional, flags } = parseArgs(argv);
-  const { tunnel, config, state } = createServices();
+  const { tunnel, config, state, process: proc } = createServices();
 
   switch (cmd) {
     case 'list':
@@ -154,6 +202,75 @@ async function main(): Promise<number> {
       );
       if (connectors.length > 1) {
         console.log(`\n${c.yellow('!')} Mas de un conector: revisa si tienes cloudflared duplicado.`);
+      }
+      console.log();
+      await printLocalStatus(proc);
+      return 0;
+    }
+
+    case 'service': {
+      const action = positional[0];
+      if (!action) {
+        await printLocalStatus(proc, { verbose: true });
+        return 0;
+      }
+      if (action !== 'start' && action !== 'stop' && action !== 'restart') {
+        throw new TunnelManagerError(`Accion invalida: "${action}". Usa start, stop o restart.`);
+      }
+      const cmd = `sudo ${sudoCommandFor(action).join(' ')}`;
+      console.log(`Voy a ejecutar: ${c.bold(cmd)}`);
+      if (!(await proc.sudoIsCached())) {
+        console.log(c.dim('   sudo pedira tu contrasena aqui en la terminal.'));
+      }
+      if (!flags.yes && !(await confirm('Continuar?'))) {
+        console.log(c.gray('cancelado'));
+        return 1;
+      }
+      const res = await proc.controlService(action);
+      if (!res.ok) {
+        console.error(`${c.red('Fallo')} ${res.command} (codigo ${res.code})`);
+        return 1;
+      }
+      console.log(`${c.green('OK')} ${res.command}`);
+      // launchd tarda un instante en reflejar el cambio de estado.
+      await new Promise((r) => setTimeout(r, 1200));
+      console.log();
+      await printLocalStatus(proc);
+      return 0;
+    }
+
+    case 'logs': {
+      const lines = await proc.recentLogs(flags.lines);
+      const st = await proc.status();
+      const src = proc.mode === 'spawn' ? 'proceso hijo' : (st.launchd.stderrPath ?? 'sin archivo');
+      console.log(c.gray(`fuente: ${src}`));
+      for (const l of lines) console.log(colorizeLog(l));
+      if (flags.follow) {
+        const r = await proc.followLogs();
+        if (!r.following) {
+          console.error(`${c.red('No pude seguir el log:')} ${r.source}`);
+          return 1;
+        }
+        proc.on('log', (line: string) => console.log(colorizeLog(line)));
+        console.log(c.gray('--- siguiendo en vivo, Ctrl-C para salir ---'));
+        await new Promise(() => undefined); // se corta con Ctrl-C
+      }
+      return 0;
+    }
+
+    case 'mode': {
+      const next = positional[0];
+      if (!next) {
+        console.log(`modo actual: ${c.bold(state.prefs.mode)}`);
+        return 0;
+      }
+      if (next !== 'service' && next !== 'spawn') {
+        throw new TunnelManagerError(`Modo invalido: "${next}". Usa service o spawn.`);
+      }
+      state.setPrefs({ mode: next });
+      console.log(`${c.green('OK')} modo = ${c.bold(next)}`);
+      if (next === 'spawn' && !config.tunnelToken) {
+        console.log(`   ${c.yellow('aviso')} falta CF_TUNNEL_TOKEN en .env; el modo spawn no podra lanzar cloudflared.`);
       }
       return 0;
     }
